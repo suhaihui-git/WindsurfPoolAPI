@@ -6,9 +6,11 @@
 import http from 'http';
 import https from 'https';
 import { log } from '../config.js';
+import { parseFields, writeStringField } from '../proto.js';
 
 const FIREBASE_API_KEY = 'AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY';
-const FIREBASE_AUTH_URL = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`;
+const PASSWORD_LOGIN_URL = 'https://windsurf.com/_devin-auth/password/login';
+const WINDSURF_POST_AUTH_URL = 'https://windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/WindsurfPostAuth';
 const FIREBASE_REFRESH_URL = `https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`;
 const CODEIUM_REGISTER_URL = 'https://api.codeium.com/register_user/';
 
@@ -118,7 +120,15 @@ function httpsRequest(url, opts, postData, proxy) {
       const bufs = [];
       res.on('data', d => bufs.push(d));
       res.on('end', () => {
-        const raw = Buffer.concat(bufs).toString('utf8');
+        const rawBuf = Buffer.concat(bufs);
+        const contentType = String(res.headers['content-type'] || '').toLowerCase();
+        const accept = String(requestOpts.headers?.Accept || '').toLowerCase();
+        const wantsProto = accept.includes('application/proto') || accept.includes('application/octet-stream');
+        if (wantsProto || contentType.includes('application/proto') || contentType.includes('application/octet-stream')) {
+          resolve({ status: res.statusCode, data: rawBuf });
+          return;
+        }
+        const raw = rawBuf.toString('utf8');
         try {
           resolve({ status: res.statusCode, data: JSON.parse(raw) });
         } catch {
@@ -149,75 +159,84 @@ function httpsRequest(url, opts, postData, proxy) {
   });
 }
 
-// ─── Login flow ───────────────────────────────────────────
+function extractPostAuthFields(buf) {
+  const fields = parseFields(buf);
+  let apiKey = '';
+  let accountId = '';
+  let orgId = '';
+
+  for (const field of fields) {
+    if (field.wireType !== 2) continue;
+    const value = field.value.toString('utf8');
+    if (field.field === 1 && value.startsWith('devin-session-token$')) apiKey = value;
+    if (field.field === 4 && value.startsWith('account-')) accountId = value;
+    if (field.field === 5 && value.startsWith('org-')) orgId = value;
+  }
+
+  return { apiKey, accountId, orgId };
+}
+
 
 /**
- * Full Windsurf login: Firebase auth → Codeium register → API key.
+ * Full Windsurf login: password login → WindsurfPostAuth → API key.
  * @param {string} email
  * @param {string} password
  * @param {object} [proxy] - { host, port, username, password }
- * @returns {{ apiKey, name, email, idToken }}
+ * @returns {{ apiKey, name, email, token, userId, accountId, orgId }}
  */
 export async function windsurfLogin(email, password, proxy = null) {
   const fingerprint = generateFingerprint();
   log.info(`Windsurf login: ${email} fp=${fingerprint['User-Agent'].slice(0, 40)}... proxy=${proxy?.host || 'none'}`);
 
-  // Step 1: Firebase sign in
-  const firebaseBody = JSON.stringify({
-    email,
-    password,
-    returnSecureToken: true,
-  });
-
-  const fbHeaders = {
+  const loginBody = JSON.stringify({ email, password });
+  const loginHeaders = {
     ...fingerprint,
     'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(firebaseBody),
+    'Content-Length': Buffer.byteLength(loginBody),
   };
 
-  const fbRes = await httpsRequest(FIREBASE_AUTH_URL, { method: 'POST', headers: fbHeaders }, firebaseBody, proxy);
-
-  if (fbRes.data.error) {
-    const msg = fbRes.data.error.message || 'Unknown Firebase error';
-    const friendly = {
-      'EMAIL_NOT_FOUND': '信箱不存在',
-      'INVALID_PASSWORD': '密碼錯誤',
-      'INVALID_LOGIN_CREDENTIALS': '信箱或密碼錯誤',
-      'USER_DISABLED': '帳號已被停用',
-      'TOO_MANY_ATTEMPTS_TRY_LATER': '嘗試太多次，請稍後再試',
-      'INVALID_EMAIL': '信箱格式錯誤',
-    }[msg] || msg;
-    throw new Error(`Firebase 登入失敗: ${friendly}`);
+  const loginRes = await httpsRequest(PASSWORD_LOGIN_URL, { method: 'POST', headers: loginHeaders }, loginBody, proxy);
+  if (loginRes.status >= 400) {
+    const msg = loginRes.data?.error || loginRes.data?.message || JSON.stringify(loginRes.data).slice(0, 200);
+    throw new Error(`Windsurf 登录失败: ${msg}`);
   }
 
-  const idToken = fbRes.data.idToken;
-  if (!idToken) throw new Error('Firebase 回應缺少 idToken');
+  const token = loginRes.data?.token;
+  const userId = loginRes.data?.user_id || '';
+  const loginEmail = loginRes.data?.email || email;
+  if (!token) throw new Error(`Windsurf 登录成功但缺少 token: ${JSON.stringify(loginRes.data).slice(0, 200)}`);
 
-  log.info(`Firebase login OK: ${email}, UID=${fbRes.data.localId}`);
-
-  // Step 2: Register with Codeium to get API key
-  const regBody = JSON.stringify({ firebase_id_token: idToken });
-  const regHeaders = {
+  const postAuthBody = writeStringField(1, token);
+  const postAuthHeaders = {
     ...fingerprint,
-    'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(regBody),
+    'Content-Type': 'application/proto',
+    'Accept': 'application/proto',
+    'Content-Length': postAuthBody.length,
   };
 
-  const regRes = await httpsRequest(CODEIUM_REGISTER_URL, { method: 'POST', headers: regHeaders }, regBody, proxy);
-
-  if (regRes.status >= 400 || !regRes.data.api_key) {
-    throw new Error(`Codeium 註冊失敗: ${JSON.stringify(regRes.data).slice(0, 200)}`);
+  const postAuthRes = await httpsRequest(WINDSURF_POST_AUTH_URL, { method: 'POST', headers: postAuthHeaders }, postAuthBody, proxy);
+  if (postAuthRes.status >= 400 || !Buffer.isBuffer(postAuthRes.data)) {
+    const preview = Buffer.isBuffer(postAuthRes.data)
+      ? postAuthRes.data.toString('utf8', 0, 200)
+      : JSON.stringify(postAuthRes.data).slice(0, 200);
+    throw new Error(`Windsurf PostAuth 失败: ${preview}`);
   }
 
-  log.info(`Codeium register OK: ${email} → key=${regRes.data.api_key.slice(0, 12)}...`);
+  const { apiKey, accountId, orgId } = extractPostAuthFields(postAuthRes.data);
+  if (!apiKey) throw new Error('Windsurf PostAuth 成功但未返回 devin-session-token');
+
+  log.info(`Windsurf login OK: ${loginEmail}, user=${userId || 'unknown'} account=${accountId || 'unknown'}`);
 
   return {
-    apiKey: regRes.data.api_key,
-    name: regRes.data.name || email,
-    email,
-    idToken,
-    refreshToken: fbRes.data.refreshToken || '',
-    apiServerUrl: regRes.data.api_server_url || '',
+    apiKey,
+    name: loginEmail,
+    email: loginEmail,
+    token,
+    userId,
+    accountId,
+    orgId,
+    refreshToken: '',
+    apiServerUrl: '',
   };
 }
 

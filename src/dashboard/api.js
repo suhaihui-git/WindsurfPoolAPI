@@ -457,6 +457,9 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         name: result.name,
         email: result.email,
         apiServerUrl: result.apiServerUrl,
+        userId: result.userId || '',
+        accountId: result.accountId || '',
+        orgId: result.orgId || '',
         account: account ? { id: account.id, email: account.email, status: account.status } : null,
       });
     } catch (err) {

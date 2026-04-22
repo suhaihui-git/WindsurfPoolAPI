@@ -198,6 +198,7 @@ async function route(req, res) {
       return json(res, 400, { error: { message: 'messages must contain at least 1 item', type: 'invalid_request' } });
     }
 
+    if (body.max_tokens == null) body.max_tokens = config.maxTokens;
     body._source = 'POST /v1/chat/completions';
     const result = await handleChatCompletions(body);
     if (result.stream) {
@@ -231,6 +232,7 @@ async function route(req, res) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
+    if (body.max_tokens == null) body.max_tokens = config.maxTokens;
     const result = await handleMessages(body);
     if (result.stream) {
       // Same streaming tuning as /v1/chat/completions — see comment above.
