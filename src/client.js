@@ -295,35 +295,21 @@ export class WindsurfClient {
       const toolCalls = [];
       let totalYielded = 0;
       let totalThinking = 0;
-      let idleCount = 0;
       let pollCount = 0;
       let sawActive = false;   // true once we've seen a non-IDLE status
       let sawText = false;     // true once at least one PLANNER_RESPONSE with text arrived
       let lastStatus = -1;
-      // "Progress" is ANY forward motion on the trajectory — text, thinking,
-      // new tool call, or a new step appearing. Using this (instead of text
-      // alone) for stall detection fixes the false-positive warm stalls where
-      // Cascade is legitimately mid-thinking but `responseText` hasn't moved.
-      let lastGrowthAt = Date.now();
       let lastStepCount = 0;
-      const maxWait = 180_000;
       const pollInterval = 250;
-      const IDLE_GRACE_MS = 8_000;     // minimum time before idle-break allowed
-      // 25s no progress on any signal = genuine stall. Was 15s + text-only,
-      // which misfired on long thinking phases and returned tiny "Let me…"
-      // preambles as if they were complete replies.
-      const NO_GROWTH_STALL_MS = 25_000;
-      const STALL_RETRY_MIN_TEXT = 300;  // stalls shorter than this → retryable error, not partial success
       const startTime = Date.now();
       let endReason = 'unknown';
 
-      while (Date.now() - startTime < maxWait) {
+      while (true) {
         if (aborted()) { endReason = 'aborted'; break; }
         await new Promise(r => setTimeout(r, pollInterval));
         if (aborted()) { endReason = 'aborted'; break; }
         pollCount++;
 
-        // Get steps
         const stepsProto = buildGetTrajectoryStepsRequest(cascadeId, 0);
         const stepsResp = await grpcUnary(
           this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
@@ -335,9 +321,6 @@ export class WindsurfClient {
         // raise it as a model-level error so the account isn't blamed.
         for (const step of steps) {
           if (step.type === 17 && step.errorText) {
-            // Log the full trajectory context so we can see WHICH tool call
-            // (if any) the error refers to. "invalid tool call" without
-            // context is useless for debugging.
             const trail = steps.map(s => ({
               type: s.type,
               status: s.status,
@@ -351,88 +334,23 @@ export class WindsurfClient {
           }
         }
 
-        // Stall detection — two flavors:
-        //   (a) "cold stall": 30s+ ACTIVE but never saw any text or tool
-        //       call → planner is deadlocked before even starting to
-        //       produce output. Rotate account, don't make the user wait.
-        //   (b) "warm stall": we already streamed some text, but it hasn't
-        //       grown for 15s while status is still non-IDLE → planner is
-        //       stuck in a tool round-trip or upstream throttle. Accept
-        //       what we have as a complete response rather than waiting
-        //       out the full 180s maxWait with the client hanging.
-        const elapsed = Date.now() - startTime;
-        const coldStallMs = Math.min(90_000, 30_000 + Math.floor(inputChars / 2000) * 5_000);
-        if (elapsed > coldStallMs && sawActive && !sawText && seenToolCallIds.size === 0) {
-          log.warn(`Cascade cold stall: ${elapsed}ms active without any text or tool call (threshold=${coldStallMs}ms, inputChars=${inputChars}), bailing`);
-          endReason = 'stall_cold';
-          const err = new Error(`Cascade planner stalled — no output after ${Math.round(coldStallMs / 1000)}s`);
-          err.isModelError = true;
-          throw err;
-        }
-        if (sawText && lastStatus !== 1 && (Date.now() - lastGrowthAt) > NO_GROWTH_STALL_MS) {
-          const diag = {
-            msSinceGrowth: Date.now() - lastGrowthAt,
-            textLen: totalYielded,
-            thinkingLen: totalThinking,
-            stepCount: yieldedByStep.size,
-            toolCalls: seenToolCallIds.size,
-            lastStatus,
-          };
-          // Short-reply stall → treat as error so handlers/chat.js retries on
-          // another account. A 50-char preamble is worse than no reply at all
-          // because the client accepts it as "successful" and shows it to the
-          // user. Retry only if we haven't streamed anything substantial yet
-          // (if we did, partial delivery + idle end is fine).
-          if (totalYielded < STALL_RETRY_MIN_TEXT) {
-            log.warn('Cascade warm stall (short, retrying on next account)', diag);
-            endReason = 'stall_warm_retry';
-            const err = new Error('Cascade planner stalled after preamble — no progress for 25s');
-            err.isModelError = true;
-            throw err;
-          }
-          log.warn('Cascade warm stall (accepting partial)', diag);
-          endReason = 'stall_warm';
-          break; // return what we have as a successful response
-        }
-
-        // Any trajectory change counts as forward progress. A new step, a new
-        // tool call proposal, or thinking growth all reset the stall timer so
-        // Cascade's slow silent planning phases don't get cut off mid-think.
-        if (steps.length > lastStepCount) {
-          lastStepCount = steps.length;
-          lastGrowthAt = Date.now();
-        }
+        if (steps.length > lastStepCount) lastStepCount = steps.length;
 
         for (let i = 0; i < steps.length; i++) {
           const step = steps[i];
 
-          // Per-step token usage. Overwrite on every poll so the map always
-          // holds the latest reported numbers (they grow monotonically as
-          // the generator emits more output). We sum across steps at the
-          // end to compute the response's total usage.
           if (step.usage) usageByStep.set(i, step.usage);
 
-          // Collect tool calls — dedupe by id so the same step seen across
-          // polls only emits once. A tool call with an existing `result`
-          // means the LS already executed it (built-in Cascade tool); we
-          // pass it through to the client for visibility.
           if (step.toolCalls && step.toolCalls.length) {
             for (const tc of step.toolCalls) {
               const key = tc.id || `${tc.name}:${tc.argumentsJson}`;
               if (seenToolCallIds.has(key)) continue;
               seenToolCallIds.add(key);
               toolCalls.push(tc);
-              lastGrowthAt = Date.now();
             }
           }
 
-          // Thinking delta: the LS keeps `thinking` as the cumulative
-          // reasoning text for the step. Track a per-step cursor and emit
-          // only the tail as reasoning_content. Crucially, thinking growth
-          // *also* resets lastGrowthAt — prior code only watched response
-          // text, so long silent thinking phases got falsely flagged as
-          // stalls and 20% of Cascade requests came back as 50-char
-          // preambles (`/tmp/...` style "let me analyze" stubs).
+          // Thinking delta: emit newly appended reasoning text only.
           const liveThink = step.thinking || '';
           if (liveThink) {
             const prevThink = thinkingByStep.get(i) || 0;
@@ -440,23 +358,14 @@ export class WindsurfClient {
               const thinkDelta = liveThink.slice(prevThink);
               thinkingByStep.set(i, liveThink.length);
               totalThinking += thinkDelta.length;
-              lastGrowthAt = Date.now();
               const tchunk = { text: '', thinking: thinkDelta, isError: false };
               chunks.push(tchunk);
               onChunk?.(tchunk);
             }
           }
 
-          // Text delta rule: prefer `responseText` (append-only stream) over
-          // `modifiedText` (LS post-pass rewrite) while we're streaming. The
-          // LS periodically swaps `response` → `modified_response` mid-turn
-          // with slightly different wording; if we blindly `entry.text =
-          // modifiedText || responseText` and take a length-based slice, the
-          // rewritten middle bytes vanish because we already advanced the
-          // cursor past them in an earlier poll. Using responseText keeps the
-          // slice monotonic. At turn end we top up with `modifiedText` (see
-          // below) so the final accumulated text is still the LS's polished
-          // version when one exists.
+          // Text delta rule: prefer responseText (append-only stream) while
+          // streaming, then top up with modifiedText once IDLE is reached.
           const liveText = step.responseText || step.text || '';
           if (!liveText) continue;
           const prev = yieldedByStep.get(i) || 0;
@@ -464,7 +373,6 @@ export class WindsurfClient {
             const delta = liveText.slice(prev);
             yieldedByStep.set(i, liveText.length);
             totalYielded += delta.length;
-            lastGrowthAt = Date.now();
             sawText = true;
             const chunk = { text: delta, thinking: '', isError: false };
             chunks.push(chunk);
@@ -472,74 +380,46 @@ export class WindsurfClient {
           }
         }
 
-        // Check status
         const statusProto = buildGetTrajectoryRequest(cascadeId);
         const statusResp = await grpcUnary(
           this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectory`, grpcFrame(statusProto)
         );
         const status = parseTrajectoryStatus(statusResp);
         lastStatus = status;
-
         if (status !== 1) sawActive = true;
 
-        if (status === 1) { // IDLE
-          // Don't allow idle-break during the warmup window unless we've
-          // already seen the planner go non-IDLE at least once. Without this
-          // guard, cascades whose trajectory hasn't kicked off yet (status
-          // stuck at 1 for the first ~600ms) terminate after only 2 polls
-          // and the client sees a near-empty reply.
-          const elapsed = Date.now() - startTime;
-          const graceOver = elapsed > IDLE_GRACE_MS;
-          if (!sawActive && !graceOver) {
-            continue; // still warming up — don't count this as idle
-          }
-          idleCount++;
-          // Require at least a little text OR a long idle streak before
-          // accepting "done", so we don't race the first visible chunk.
-          const canBreak = sawText ? idleCount >= 2 : idleCount >= 4;
-          if (canBreak) {
-            // Final sweep
-            const finalResp = await grpcUnary(
-              this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
-            );
-            const finalSteps = parseTrajectorySteps(finalResp);
-            for (let i = 0; i < finalSteps.length; i++) {
-              const step = finalSteps[i];
-              const responseText = step.responseText || '';
-              const modifiedText = step.modifiedText || '';
-              const prev = yieldedByStep.get(i) || 0;
+        if (status === 1) {
+          const finalResp = await grpcUnary(
+            this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
+          );
+          const finalSteps = parseTrajectorySteps(finalResp);
+          for (let i = 0; i < finalSteps.length; i++) {
+            const step = finalSteps[i];
+            const responseText = step.responseText || '';
+            const modifiedText = step.modifiedText || '';
+            const prev = yieldedByStep.get(i) || 0;
 
-              // Normal top-up: responseText grew past what we streamed.
-              if (responseText.length > prev) {
-                const delta = responseText.slice(prev);
-                yieldedByStep.set(i, responseText.length);
-                totalYielded += delta.length;
-                chunks.push({ text: delta, thinking: '', isError: false });
-                onChunk?.({ text: delta, thinking: '', isError: false });
-              }
-
-              // Modified-response top-up: only if it's a strict extension of
-              // what we already emitted. If modifiedText rewrites the prefix
-              // (common when LS polishes), emitting the tail would splice
-              // wrong content onto the stream, so we skip it and keep the
-              // raw responseText we already showed.
-              const cursor = yieldedByStep.get(i) || 0;
-              if (modifiedText.length > cursor && modifiedText.startsWith(responseText)) {
-                const delta = modifiedText.slice(cursor);
-                yieldedByStep.set(i, modifiedText.length);
-                totalYielded += delta.length;
-                chunks.push({ text: delta, thinking: '', isError: false });
-                onChunk?.({ text: delta, thinking: '', isError: false });
-              }
+            if (responseText.length > prev) {
+              const delta = responseText.slice(prev);
+              yieldedByStep.set(i, responseText.length);
+              totalYielded += delta.length;
+              chunks.push({ text: delta, thinking: '', isError: false });
+              onChunk?.({ text: delta, thinking: '', isError: false });
             }
-            endReason = sawText ? 'idle_done' : 'idle_empty';
-            break;
+
+            const cursor = yieldedByStep.get(i) || 0;
+            if (modifiedText.length > cursor && modifiedText.startsWith(responseText)) {
+              const delta = modifiedText.slice(cursor);
+              yieldedByStep.set(i, modifiedText.length);
+              totalYielded += delta.length;
+              chunks.push({ text: delta, thinking: '', isError: false });
+              onChunk?.({ text: delta, thinking: '', isError: false });
+            }
           }
-        } else {
-          idleCount = 0;
+          endReason = sawText ? 'idle_done' : 'idle_empty';
+          break;
         }
       }
-      if (endReason === 'unknown') endReason = 'max_wait';
 
       // Structured summary so we can diagnose short/empty completions after
       // the fact. sawActive=false + sawText=false + idle_empty = the planner
