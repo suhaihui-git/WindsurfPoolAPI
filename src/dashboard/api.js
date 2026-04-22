@@ -24,6 +24,7 @@ import { MODELS, MODEL_TIER_ACCESS as _TIER_TABLE, getTierModels as _getTierMode
 import { windsurfLogin, refreshFirebaseToken, reRegisterWithCodeium } from './windsurf-login.js';
 import { getModelAccessConfig, setModelAccessMode, setModelAccessList, addModelToList, removeModelFromList } from './model-access.js';
 import { checkMessageRateLimit } from '../windsurf-api.js';
+import { sanitizePublicErrorMessage } from '../error-format.js';
 
 function json(res, status, body) {
   const data = JSON.stringify(body);
@@ -131,7 +132,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         ...getAccountCount(),
       });
     } catch (err) {
-      return json(res, 400, { error: err.message });
+      return json(res, 400, { error: sanitizePublicErrorMessage('Authentication failed') });
     }
   }
 
@@ -158,7 +159,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       if (!result) return json(res, 404, { error: 'Account not found' });
       return json(res, 200, { success: true, ...result });
     } catch (err) {
-      return json(res, 500, { error: err.message });
+      return json(res, 500, { error: sanitizePublicErrorMessage('Upstream service error') });
     }
   }
 
@@ -396,7 +397,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       const sizeAfter = Object.keys(MODELS).length;
       return json(res, 200, { success: true, before: sizeBefore, after: sizeAfter, added: sizeAfter - sizeBefore });
     } catch (err) {
-      return json(res, 500, { error: err.message });
+      return json(res, 500, { error: sanitizePublicErrorMessage('Upstream service error') });
     }
   }
 
@@ -463,7 +464,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         account: account ? { id: account.id, email: account.email, status: account.status } : null,
       });
     } catch (err) {
-      return json(res, 400, { error: err.message });
+      return json(res, 400, { error: sanitizePublicErrorMessage('Authentication failed') });
     }
   }
 
@@ -496,7 +497,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         account: account ? { id: account.id, email: account.email, status: account.status } : null,
       });
     } catch (err) {
-      return json(res, 400, { error: err.message });
+      return json(res, 400, { error: sanitizePublicErrorMessage('Authentication failed') });
     }
   }
 
@@ -512,7 +513,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       const result = await checkMessageRateLimit(acct.apiKey, proxy);
       return json(res, 200, { success: true, account: acct.email, ...result });
     } catch (err) {
-      return json(res, 500, { error: err.message });
+      return json(res, 500, { error: sanitizePublicErrorMessage('Upstream service error') });
     }
   }
 
@@ -535,7 +536,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       setAccountTokens(acct.id, { apiKey: apiKey || acct.apiKey, refreshToken: newRefresh || acct.refreshToken, idToken });
       return json(res, 200, { success: true, keyChanged, email: acct.email });
     } catch (err) {
-      return json(res, 400, { error: err.message });
+      return json(res, 400, { error: sanitizePublicErrorMessage('Authentication failed') });
     }
   }
 

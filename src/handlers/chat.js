@@ -23,6 +23,7 @@ import {
   buildToolPreambleForProto,
 } from './tool-emulation.js';
 import { sanitizeText, PathSanitizeStream } from '../sanitize.js';
+import { buildOpenAIError, sanitizePublicErrorMessage, writeOpenAIStreamError } from '../error-format.js';
 
 const HEARTBEAT_MS = 5_000;
 const QUEUE_RETRY_MS = 1_000;
@@ -194,7 +195,7 @@ export async function handleChatCompletions(body) {
   // Global model access control (allowlist / blocklist from dashboard)
   const access = isModelAllowed(modelKey);
   if (!access.allowed) {
-    return { status: 403, body: { error: { message: access.reason, type: 'model_blocked' } } };
+    return { status: 403, body: buildOpenAIError('Requested model is blocked', 'model_blocked') };
   }
 
   // Per-account model routing preflight: if NO active account has this
@@ -208,12 +209,7 @@ export async function handleChatCompletions(body) {
   if (!anyEligible) {
     return {
       status: 403,
-      body: {
-        error: {
-          message: `模型 ${displayModel} 在当前账号池中不可用（未订阅或已被封禁）`,
-          type: 'model_not_entitled',
-        },
-      },
+      body: buildOpenAIError('Requested model is currently unavailable for the active account pool', 'model_not_entitled'),
     };
   }
 
@@ -300,7 +296,7 @@ export async function handleChatCompletions(body) {
 
     await ensureLs(acct.proxy);
     const ls = getLsFor(acct.proxy);
-    if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
+    if (!ls) { lastErr = { status: 503, body: buildOpenAIError('Upstream service unavailable', 'ls_unavailable') }; break; }
     // Cascade pins cascade_id to a specific LS port too; if the LS it was
     // born on has been replaced, the cascade_id is dead.
     if (reuseEntry && reuseEntry.lsPort !== ls.port) {
@@ -336,10 +332,10 @@ export async function handleChatCompletions(body) {
   if (!lastErr || lastErr.status === 429) {
     const rl = isAllRateLimited(modelKey);
     if (rl.allLimited) {
-      return { status: 429, body: { error: { message: `${displayModel} 所有账号均已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs } } };
+      return { status: 429, body: buildOpenAIError(`${displayModel} rate limit reached, please retry later`, 'rate_limit_exceeded', { retry_after_ms: rl.retryAfterMs }) };
     }
   }
-  return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
+  return lastErr || { status: 503, body: buildOpenAIError('No active upstream accounts available', 'pool_exhausted') };
 }
 
 async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0) {
@@ -493,7 +489,10 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     }
     return {
       status: err.isModelError ? 403 : 502,
-      body: { error: { message: sanitizeText(err.message), type: err.isModelError ? 'model_not_available' : 'upstream_error' } },
+      body: buildOpenAIError(
+        err.isModelError ? 'Requested model is currently unavailable' : 'Upstream service error',
+        err.isModelError ? 'model_not_available' : 'upstream_error',
+      ),
     };
   }
 }
@@ -692,7 +691,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
 
           try { await ensureLs(acct.proxy); } catch (e) { lastErr = e; break; }
           const ls = getLsFor(acct.proxy);
-          if (!ls) { lastErr = new Error('No LS instance available'); break; }
+          if (!ls) { lastErr = new Error('Upstream service unavailable'); break; }
           if (reuseEntry && reuseEntry.lsPort !== ls.port) {
             log.info('Chat: cascade reuse skipped — LS port changed');
             reuseEntry = null;
@@ -807,21 +806,16 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           model, success: false, durationMs: Date.now() - startTime,
           accountId: currentApiKey, source, credit: 0, tokens: null,
         });
-        try {
-          if (!rolePrinted) {
-            send({ id, object: 'chat.completion.chunk', created, model,
-              choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
-          }
-          // Check if failure is due to all accounts being rate-limited
-          const rl = isAllRateLimited(modelKey);
-          const errMsg = rl.allLimited
-            ? `${model} 所有账号均已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`
-            : sanitizeText(lastErr?.message || 'no accounts');
-          send({ id, object: 'chat.completion.chunk', created, model,
-            choices: [{ index: 0, delta: { content: `\n[Error: ${errMsg}]` }, finish_reason: 'stop' }] });
-          res.write('data: [DONE]\n\n');
-        } catch {}
-        if (!res.writableEnded) res.end();
+        const rl = isAllRateLimited(modelKey);
+        const errType = rl.allLimited ? 'rate_limit_exceeded' : (lastErr?.isModelError ? 'model_not_available' : 'upstream_error');
+        const errMsg = rl.allLimited
+          ? `${model} 已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`
+          : (lastErr?.isModelError ? 'Requested model is currently unavailable' : 'Upstream service error');
+        if (res.headersSent) {
+          if (!res.writableEnded) res.end();
+        } else {
+          writeOpenAIStreamError(res, rl.allLimited ? 429 : (lastErr?.isModelError ? 403 : 502), errMsg, errType, rl.allLimited ? { retry_after_ms: rl.retryAfterMs } : {});
+        }
       } finally {
         stopHeartbeat();
       }

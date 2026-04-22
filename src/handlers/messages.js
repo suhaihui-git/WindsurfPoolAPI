@@ -17,6 +17,7 @@
 
 import { randomUUID } from 'crypto';
 import { handleChatCompletions } from './chat.js';
+import { sanitizePublicErrorMessage } from '../error-format.js';
 import { resolveModel } from '../models.js';
 import { config, log } from '../config.js';
 
@@ -661,7 +662,7 @@ export async function handleMessages(anthropicBody) {
     const result = await handleChatCompletions(openaiBody);
     if (result.status !== 200) {
       // Re-shape the error envelope to Anthropic's shape
-      const msg = result.body?.error?.message || 'Unknown error';
+      const msg = sanitizePublicErrorMessage(result.body?.error?.message || 'Unknown error');
       const type = result.body?.error?.type || 'api_error';
       const anthType = {
         auth_error: 'authentication_error',
@@ -691,7 +692,7 @@ export async function handleMessages(anthropicBody) {
   const result = await handleChatCompletions(openaiBody);
   if (result.status !== 200 || !result.stream) {
     // Upstream returned a synchronous error before streaming started — re-shape
-    const msg = result.body?.error?.message || 'Upstream failed to start stream';
+    const msg = sanitizePublicErrorMessage(result.body?.error?.message || 'Upstream failed to start stream');
     const type = result.body?.error?.type || 'api_error';
     return {
       status: result.status,
@@ -719,7 +720,7 @@ export async function handleMessages(anthropicBody) {
       } catch (err) {
         log.error(`messages: stream handler error: ${err.message}`);
         if (!realRes.writableEnded) {
-          realRes.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: err.message } })}\n\n`);
+          realRes.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: sanitizePublicErrorMessage('Upstream service error') } })}\n\n`);
           realRes.end();
         }
       }

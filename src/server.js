@@ -23,6 +23,7 @@ import { handleModels } from './handlers/models.js';
 import { handleMessages } from './handlers/messages.js';
 import { handleDashboardApi } from './dashboard/api.js';
 import { config, log } from './config.js';
+import { buildOpenAIError, sanitizePublicErrorMessage } from './error-format.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -115,7 +116,7 @@ async function route(req, res) {
   if (path === '/auth/login' && method === 'POST') {
     let body;
     try { body = JSON.parse(await readBody(req)); } catch {
-      return json(res, 400, { error: 'Invalid JSON' });
+      return json(res, 400, buildOpenAIError('Invalid JSON', 'invalid_request'));
     }
 
     try {
@@ -139,7 +140,7 @@ async function route(req, res) {
             }
             results.push({ id: result.id, email: result.email, status: result.status });
           } catch (err) {
-            results.push({ email: acct.email, error: err.message });
+            results.push({ email: acct.email, error: sanitizePublicErrorMessage('Authentication failed') });
           }
         }
         return json(res, 200, { results, ...getAccountCount() });
@@ -166,7 +167,7 @@ async function route(req, res) {
       });
     } catch (err) {
       log.error('Login failed:', err.message);
-      return json(res, 401, { error: err.message });
+      return json(res, 401, buildOpenAIError('Authentication failed', 'auth_error'));
     }
   }
 
@@ -261,7 +262,7 @@ export function startServer() {
       await route(req, res);
     } catch (err) {
       log.error('Handler error:', err);
-      if (!res.headersSent) json(res, 500, { error: { message: 'Internal error', type: 'server_error' } });
+      if (!res.headersSent) json(res, 500, buildOpenAIError('Internal server error', 'server_error'));
     }
   });
 
