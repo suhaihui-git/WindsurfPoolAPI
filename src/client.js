@@ -407,8 +407,11 @@ export class WindsurfClient {
               onChunk?.({ text: delta, thinking: '', isError: false });
             }
 
+            // Modified-response top-up: if the LS post-pass produced a longer
+            // final text, emit the unseen tail even when it rewrote earlier
+            // bytes instead of strictly extending responseText.
             const cursor = yieldedByStep.get(i) || 0;
-            if (modifiedText.length > cursor && modifiedText.startsWith(responseText)) {
+            if (modifiedText.length > cursor) {
               const delta = modifiedText.slice(cursor);
               yieldedByStep.set(i, modifiedText.length);
               totalYielded += delta.length;
