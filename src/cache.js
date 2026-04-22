@@ -8,14 +8,21 @@
  */
 
 import { createHash } from 'crypto';
-import { log } from './config.js';
+import { config, log } from './config.js';
 
-const TTL_MS = 5 * 60 * 1000;
 const MAX_ENTRIES = 500;
 
 // Map preserves insertion order → we evict the oldest when over capacity.
 const _store = new Map();
 const _stats = { hits: 0, misses: 0, stores: 0, evictions: 0 };
+
+function ttlMs() {
+  return config.responseCacheTtlSeconds * 1000;
+}
+
+export function isCacheEnabled() {
+  return !!config.responseCacheEnabled;
+}
 
 function normalize(body) {
   // Only the semantically meaningful fields — ignore stream flag, user id, etc.
@@ -36,6 +43,10 @@ export function cacheKey(body) {
 }
 
 export function cacheGet(key) {
+  if (!isCacheEnabled()) {
+    _stats.misses++;
+    return null;
+  }
   const entry = _store.get(key);
   if (!entry) { _stats.misses++; return null; }
   if (entry.expiresAt < Date.now()) {
@@ -51,9 +62,10 @@ export function cacheGet(key) {
 }
 
 export function cacheSet(key, value) {
+  if (!isCacheEnabled()) return;
   // Don't cache empty or partial results
   if (!value || (!value.text && !(value.chunks && value.chunks.length))) return;
-  _store.set(key, { value, expiresAt: Date.now() + TTL_MS });
+  _store.set(key, { value, expiresAt: Date.now() + ttlMs() });
   _stats.stores++;
   while (_store.size > MAX_ENTRIES) {
     const oldest = _store.keys().next().value;
@@ -65,9 +77,11 @@ export function cacheSet(key, value) {
 export function cacheStats() {
   const total = _stats.hits + _stats.misses;
   return {
+    enabled: isCacheEnabled(),
     size: _store.size,
     maxSize: MAX_ENTRIES,
-    ttlMs: TTL_MS,
+    ttlMs: ttlMs(),
+    ttlSeconds: config.responseCacheTtlSeconds,
     hits: _stats.hits,
     misses: _stats.misses,
     stores: _stats.stores,

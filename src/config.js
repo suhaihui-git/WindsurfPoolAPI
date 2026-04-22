@@ -59,6 +59,8 @@ export const config = {
   codeiumApiUrl: process.env.CODEIUM_API_URL || 'https://server.self-serve.windsurf.com',
   defaultModel: process.env.DEFAULT_MODEL || 'claude-4.5-sonnet-thinking',
   maxTokens: parseInt(process.env.MAX_TOKENS || '8192', 10),
+  responseCacheEnabled: /^(1|true|yes|on)$/i.test(process.env.RESPONSE_CACHE_ENABLED || 'false'),
+  responseCacheTtlSeconds: Math.max(1, parseInt(process.env.RESPONSE_CACHE_TTL_SECONDS || '300', 10) || 300),
   logLevel: process.env.LOG_LEVEL || 'info',
 
   // Language server — auto-detect default binary name by platform/arch so
