@@ -167,11 +167,10 @@ export class WindsurfClient {
 
     log.debug(`CascadeChat: uid=${modelUid} enum=${modelEnum} msgs=${messages.length} reuse=${!!reuseEntry}`);
 
-    // One-shot per-LS workspace init (idempotent; typically pre-warmed at
-    // LS startup). Falls back to a local session id if the LS entry is gone.
-    const lsEntry = getLsEntryByPort(this.port);
-    await this.warmupCascade().catch(() => {});
-    let sessionId = reuseEntry?.sessionId || lsEntry?.sessionId || randomUUID();
+    // Reused cascades keep their original sessionId; fresh requests always get
+    // a brand-new sessionId so downstream treats every non-reused request as an
+    // independent conversation.
+    let sessionId = reuseEntry?.sessionId || randomUUID();
 
     // "panel state not found" means the LS forgot the panel for our sessionId
     // (LS restarted, TTL expired, etc.). Re-run warmupCascade with a fresh
@@ -201,7 +200,7 @@ export class WindsurfClient {
         if (!isPanelMissing(e)) throw e;
         log.warn(`Panel state missing, re-warming LS port=${this.port}`);
         await this.warmupCascade(true).catch(() => {});
-        sessionId = getLsEntryByPort(this.port)?.sessionId || randomUUID();
+        sessionId = randomUUID();
         if (reuseEntry) reuseEntry.cascadeId = null; // force StartCascade
         cascadeId = await openCascade();
       }
