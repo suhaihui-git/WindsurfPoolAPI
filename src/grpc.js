@@ -60,22 +60,15 @@ export function extractGrpcFrames(buf) {
  * @param {number} timeout - Timeout in ms
  * @returns {Promise<Buffer>} Protobuf response (stripped of gRPC frame)
  */
-export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
+export function grpcUnary(port, csrfToken, path, body, _timeout) {
   return new Promise((resolve, reject) => {
     const client = http2.connect(`http://localhost:${port}`);
     const chunks = [];
-    let timer;
 
     client.on('error', (err) => {
-      clearTimeout(timer);
       client.close();
       reject(err);
     });
-
-    timer = setTimeout(() => {
-      client.close();
-      reject(new Error('gRPC unary timeout'));
-    }, timeout);
 
     const req = client.request({
       ':method': 'POST',
@@ -95,7 +88,6 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
     });
 
     req.on('end', () => {
-      clearTimeout(timer);
       client.close();
       if (grpcStatus !== '0') {
         const msg = grpcMessage ? decodeURIComponent(grpcMessage) : `gRPC status ${grpcStatus}`;
@@ -107,7 +99,6 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
     });
 
     req.on('error', (err) => {
-      clearTimeout(timer);
       client.close();
       reject(err);
     });
@@ -128,22 +119,15 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
  * @param {object} opts - { onData, onEnd, onError, timeout }
  */
 export function grpcStream(port, csrfToken, path, body, opts = {}) {
-  const { onData, onEnd, onError, timeout = 300000 } = opts;
+  const { onData, onEnd, onError } = opts;
 
   const client = http2.connect(`http://localhost:${port}`);
-  let timer;
   let pendingBuf = Buffer.alloc(0);
 
   client.on('error', (err) => {
-    clearTimeout(timer);
     client.close();
     onError?.(err);
   });
-
-  timer = setTimeout(() => {
-    client.close();
-    onError?.(new Error('gRPC stream timeout'));
-  }, timeout);
 
   const req = client.request({
     ':method': 'POST',
@@ -178,7 +162,6 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
   });
 
   req.on('end', () => {
-    clearTimeout(timer);
     client.close();
     if (grpcStatus !== '0') {
       const msg = grpcMessage ? decodeURIComponent(grpcMessage) : `gRPC status ${grpcStatus}`;
@@ -189,7 +172,6 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
   });
 
   req.on('error', (err) => {
-    clearTimeout(timer);
     client.close();
     onError?.(err);
   });
